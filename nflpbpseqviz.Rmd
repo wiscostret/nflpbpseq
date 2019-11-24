@@ -1,0 +1,262 @@
+---
+title: "nflpbpseqviz"
+output: 
+  html_document:
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This code walks through how to generate a basic play-by-play sequence overview for NFL games, as developed by [@wiscostretford](twitter.com/wiscostretford).
+
+# Loading libraries
+
+```{r,warning=F,error=F,message=F}
+library(tidyverse)
+library(nflscrapR)
+library(ggimage)
+library(hrbrthemes)
+```
+
+# Downloading play-by-play data using nflscrapR
+
+Using nflscrapR's functions, we can download the play-by-play (pbp) data for any game. The code below will work for any NFL game, but let's take an example: the 2019 season opener, Packers @ Bears.
+
+To find the game_id (2019090500), we use the scrape_game_ids() function.
+
+```{r,warning=F,error=F}
+
+scrape_game_ids(2019, weeks = 1)
+
+```
+
+Then we scrape the pbp data using scrape_json_play_by_play(), and check out the data structure. It may take a minute or so to scrape the data. Alternatively, the raw data for completed games can be grabbed in the [nflscrapr-data](https://github.com/ryurko/nflscrapR-data) repo.
+
+```{r,warning=F,error=F}
+
+pbp <- scrape_json_play_by_play(2019090500)
+
+head(pbp)
+```
+
+# Data choices, cleaning and grouping
+
+To produce a useful overview, we have to do some choices, including cleaning and grouping the same. There are simply too many different play types, outcomes and variables for each play to visualize. Here, we will focus on sequencing of basic play types, yards gained, scoring, and key defensive actions. Thus, we need to isolate those variables, and create some new ones to deal with edge cases that are not addressed in the pbp data.
+
+```{r}
+
+# First we compile the play types into five base categories (pass, run, kick, penalty, other)
+
+pbp2 <- pbp %>% 
+  mutate(play_type = case_when(play_type == "no_play" & penalty > 0 ~ "Penalty", TRUE ~ as.character(play_type))) %>% # this translates instances of pre-snap penalties to a 'Penalty' play rather than a no_play 
+  mutate(play_type2 = case_when(
+    play_type == "pass" ~ "Pass",
+    play_type == "run" ~ "Run",
+    play_type == "qb_spike" ~ "Other",
+    play_type == "qb_kneel" ~ "Other",
+    play_type == "field_goal" ~ "Kick",
+    play_type == "extra_point" ~ "Kick",
+    play_type == "kickoff" ~ "Kick",
+    play_type == "punt" ~ "Kick",
+    play_type == "Penalty" ~ "Penalty",
+    TRUE ~ as.character(play_type))) %>% 
+  
+# Next we create a new variable that shows score changes by comparing the pre- and post-play team scores
+
+  mutate(scorechange = ifelse(
+    posteam_score != posteam_score_post, 
+    posteam_score_post - posteam_score,
+    defteam_score - defteam_score_post)) %>% 
+    
+# Next we create dummy variables for key defensive actions - fumble recoveries, interceptions, and sacks
+    
+  mutate(other = case_when(
+    fumble_lost > 0 ~ "Fumble lost",
+    interception > 0 ~ "Interception",
+    sack > 0 ~ "Sack",
+    TRUE ~ "")) %>%
+
+# Next we filter out unknown/missing plays or no plays
+    
+  filter(!is.na(play_type)) %>% 
+  filter(!play_type == "no_play") %>%
+    
+# Next we create a 'step' variable to represent the play number in a given possession
+  
+  group_by(drive) %>% 
+  mutate(
+    step = row_number(),
+    label = paste0(posteam," (drive ",drive,")")) %>%
+
+# Next we compile a new variable, 'ydsgained2', to represent yards gained from plays or penalties:
+    
+  mutate(
+  ydsgained2 = case_when(
+    penalty > 0 ~ penalty_yards,
+    TRUE ~ yards_gained)) %>% 
+
+# Next we make sure the play_id is in the right numeric format:
+
+  mutate(play_id = as.numeric(play_id))
+
+# Finally before plotting we add in the team logos, to be used for plotting:
+
+nfllogos <- read.csv("https://raw.githubusercontent.com/statsbylopez/BlogPosts/master/nfl_teamlogos.csv") %>% mutate(team_code = as.character(team_code))
+
+pbp2 <- left_join(pbp2,nfllogos,by=c("posteam"="team_code"))
+
+```
+
+Now we are ready to plot, which we'll do in a tiled format for illustrate the play-by-play sequencing.
+
+```{r, fig.width=9,fig.height=7,fig.dpi=250} 
+
+# Base tile
+
+p <- ggplot(data = pbp2) +
+  geom_tile(
+    aes(
+      y=reorder(reorder(label,-drive),-play_id),
+      x=step,
+      fill=play_type2,
+      alpha=ydsgained2),
+    colour="darkgrey") +
+    
+  scale_fill_manual(limits=c("Pass","Run","Kick","Other","Penalty"),breaks=c("Pass","Run","Kick","Other","Penalty"),values=c("Pass"="#008837","Run"="#0571b0","Other"="#bababa","Kick"="#e66101","Penalty"="#ffff33"),name="Play type") +
+    
+  scale_alpha(range=c(0.05,1),limits=c(-20,20),breaks=c(-20,-10,0,10,20),labels=c("-20+","-10","0","10","20+"),name="Yards gained") +
+  
+  scale_x_continuous(breaks=1:max(pbp2$step)) +
+  
+# Adding NFL logos on the x axis
+
+  geom_image(
+    aes(
+      y=reorder(reorder(label,-drive),-play_id),
+      x=-0.5,
+      image=url),
+    size=0.04) +
+    
+  geom_segment(
+    aes(
+      y = reorder(reorder(label,-drive),-play_id),
+      yend = reorder(reorder(label,-drive),-play_id),
+      x = 0.1,
+      xend = 0.3),
+    colour="darkgrey")
+
+# Adding half time and final markers and text
+
+halftime <- pbp2 %>% # identifying where in the drive label sequence half time and full time are
+  filter(game_half!="Overtime") %>% 
+  group_by(game_half) %>% 
+  top_n(.,-1,-play_id) %>% 
+  select(game_half,label) %>% 
+  mutate(y = length(unique(pbp2$label)) - which(unique(pbp2$label)==label) + 0.5)
+
+p <- p + geom_segment(data = halftime,
+    aes(
+      y = y, 
+      yend = y, 
+      x = 0.5,
+      xend = max(pbp2$step)+0.25),
+    linetype="dashed") +
+    
+  geom_label(data = halftime,
+    aes(
+      y = y,
+      x = max(pbp2$step)-0.25,
+      label=ifelse(game_half=="Half1","END HALF",ifelse(game_half=="Half2","END REGULATION",""))),
+    label.size = 0, size = 2, vjust = -0.25, label.padding = unit(0.01,"cm"))
+
+# Adding score text and notation
+
+p <- p +
+  
+  geom_text(data=pbp2 %>% filter(scorechange!=0), # plotting for possession team scores 
+  aes(
+    y=reorder(reorder(label,-drive),-play_id),
+    x=step,
+    label=ifelse(scorechange>0,paste0("+",scorechange),"")),
+  fontface="bold",
+  size=5) +
+  
+  geom_text(data=pbp2 %>% filter(scorechange!=0), # plotting for defensive team scores
+  aes(
+    y=reorder(reorder(label,-drive),-play_id),
+    x=step,
+    label=ifelse(scorechange<0,paste0("+",abs(scorechange)),"")),
+  fontface="bold",
+  size=5,
+  colour="red") +
+
+  geom_label(data=pbp2 %>% filter(scorechange!=0) %>% group_by(drive) %>% top_n(.,-1,-play_id), # adding a score summary for each new score
+  aes(
+    y=reorder(reorder(label,-drive),-play_id),
+    x=max(pbp2$step)+1.75,
+    label=paste(total_home_score,"-",total_away_score)),
+  label.padding=unit(0.15,"lines"))
+
+# Plotting new tile surrounds for key defensive actions (fumbles, interceptions, sacks)
+
+p <- p + geom_tile(data=pbp2 %>% filter(other!=""),
+  aes(
+    y=reorder(reorder(label,-drive),-play_id),
+    x=step,
+    fill=NA,
+    linetype=other,
+    colour=other),
+  size=1,
+  width=1) +
+  
+  scale_colour_manual(limits=c("Fumble lost","Interception","Sack"),name="Event", values=c("red","red","black")) +
+  
+  scale_linetype_manual(limits=c("Fumble lost","Interception","Sack"),name="Event",values=c("Fumble lost"="dotted","Interception"="solid","Sack"="dashed"))
+
+# Adding a spacing line between the plot and the legends
+
+p  <- p + geom_vline(aes(xintercept=max(pbp2$step+3)),linetype="dashed")
+
+# Adding theme customizations, using hrbrthemes' nice and clear ipsum_tw theme
+
+p <- p +
+  theme_ipsum_tw() +
+  theme(
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    plot.subtitle=element_text(colour="darkgrey",size=9.5),
+    plot.caption=element_text(face="italic",hjust=0.5),
+    axis.text.y=element_blank()) +
+
+# Adding labels
+  
+  labs(
+    y = "",
+    x = "",
+    title = paste0("Play-by-Play Overview: ",pbp2$home_team[1]," vs. ",pbp2$away_team[1]," (",pbp2$game_date[1],")"),
+    subtitle = "'Other' covers spikes and kneels.",
+    caption = paste0("nfplscrapR data | GameID: ",pbp2$game_id[1], " | design: @wiscostretford")) +
+  
+# Sorting and colouring legends
+  
+  guides(
+    fill = guide_legend(order = 1,override.aes=list(colour=NA)), 
+    alpha = guide_legend(order = 2,override.aes=list(fill="#008837",colour=NA)),
+    colour = guide_legend(order = 3,override.aes=list(fill=NA)),
+    linetype = guide_legend(order = 3))
+
+# Final plot
+
+p
+
+```
+
+
+
+
+  
+
+    
+
